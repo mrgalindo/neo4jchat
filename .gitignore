@@ -1,0 +1,53 @@
+# OS and editor junk
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*.orig
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pdb
+.venv/
+venv/
+.env
+.env.*
+.venv*
+.python-version
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+.cache/
+
+# Node / JS
+node_modules/
+dist/
+build/
+.npm/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE/Editor settings
+.vscode/
+.idea/
+
+# Logs and temp
+logs/
+*.log
+/tmp/
+
+# macOS
+.AppleDouble
+.LSOverride
+Icon
+
+# Other
+*.bak
+*.tmp
+
