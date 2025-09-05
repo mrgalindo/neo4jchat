@@ -88,12 +88,13 @@ async def run_query(query: str, model: str = "gpt-4", temperature: float | None 
 
             #Operating constraints
             - Grounded in Structure and Evidence: Use only the graph and vector indexes; do not invent any structural elements (properties, nodes, relationships) or factual evidence.
-            - Precise Tooling: Call the specific set of tools required to reliably answer the question.
+            - Precise Tooling: Call the specific set of tools required to reliably answer the question. When calling any tool, include a 'reason' field in the tool arguments with a one-sentence justification for why this tool is appropriate.
 
             #Tool Routing
             - GRAPH_SEARCH — Use for structure/attribution: who/what/where, affiliations, sessions, references, topics, counts, traversals, talkingpoint-to-topic links, cross-references.
             - SEMANTIC_SEARCH — Use for content-only meaning. Set node_label to one of Answer | Question | Talkingpoint.
             - HYBRID_SEARCH — Use when the query mixes content and structure/attribution (e.g., "who said what about X"). Provide node_label (Answer | Question | Talkingpoint) for the semantic portion.
+            
 
             #Knowledge Graph Ontology (labels, key properties, directions)
             ##Entities: 

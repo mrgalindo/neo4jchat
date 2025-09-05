@@ -111,13 +111,19 @@ class SemanticSearchArgs(BaseModel):
     node_label: Literal["Answer", "Question", "Talkingpoint"] = Field(
         "Answer", description="The node label to search over for semantic meaning."
     )
+    reason: str = Field(
+        ..., description="Single-sentence justification for using this tool for this step (no chain-of-thought)."
+    )
 
 
 @tool("semantic_search", args_schema=SemanticSearchArgs)
-async def semantic_search(query: str, node_label: str = "Answer") -> str:
-    """Search text content for themes and concepts in specified node type.
-    node_label: Answer | Question | Talkingpoint
-    Use for: content meaning, themes, concepts. Cannot answer attribution or 'who' questions."""
+async def semantic_search(query: str, node_label: str = "Answer", reason: str = "") -> str:
+    """Content-only semantic retrieval over Answer|Question|Talkingpoint text.
+    Use for themes and meaning in the text; not for attribution, counts, or relationship traversal.
+    Args:
+    - query: user query text
+    - node_label: one of Answer | Question | Talkingpoint
+    - reason: REQUIRED. Single-sentence justification for calling semantic_search for this step (no chain-of-thought)."""
     
     # Handle JSON string input from agent
     import json
@@ -170,13 +176,17 @@ async def _semantic_search_impl(query: str, node_label: str) -> str:
 
 class GraphSearchArgs(BaseModel):
     query: str = Field(..., description="The structural/attribution query to answer with Cypher.")
+    reason: str = Field(..., description="Single-sentence justification for using this tool for this step (no chain-of-thought).")
 
 
 @tool("graph_search", args_schema=GraphSearchArgs)
-async def graph_search(query: str) -> str:
-    """Graph traversal for attribution and structural relationships.
-    Use for: speaker/organizational attribution, session structure, topic connections, talkingpoint relationships, reference tracking.
-    Cannot discover content themes - use semantic_search for meaning."""
+async def graph_search(query: str, reason: str) -> str:
+    """Cypher-based graph traversal for structural/attribution queries (who/what/where).
+    Use for structural queries like affiliations, sessions, references, topic connections, counts, traversals, and talkingpoint relationships.
+    Not for content-only semantics—use semantic_search for meaning.
+    Args:
+    - query: natural-language structural question to answer with Cypher
+    - reason: REQUIRED. Single-sentence justification for calling graph_search for this step (no chain-of-thought)."""
     cypher_chain = get_graph_chain()
     if not cypher_chain:
         # Bubble up the last recorded initialization error for clarity
@@ -197,13 +207,18 @@ class HybridSearchArgs(BaseModel):
     node_label: Literal["Answer", "Question", "Talkingpoint"] = Field(
         "Answer", description="The node label to use for the semantic component."
     )
+    reason: str = Field(..., description="Single-sentence justification for using this tool for this step (no chain-of-thought).")
 
 
 @tool("hybrid_search", args_schema=HybridSearchArgs)
-async def hybrid_search(query: str, node_label: str = "Answer") -> str:
-    """Combined content search + relationship traversal for attribution queries.
-    node_label: Answer | Question | Talkingpoint  
-    Use for: content + attribution combinations, 'who mentioned what about X' patterns."""
+async def hybrid_search(query: str, node_label: str = "Answer", reason: str = "") -> str:
+    """Combines semantic_search (content) and graph_search (structure) to answer mixed queries.
+    Provide node_label for the semantic component (Answer | Question | Talkingpoint).
+    Use when the query mixes content meaning with attribution/relationships (e.g., 'who said what about X').
+    Args:
+    - query: user query text
+    - node_label: semantic target label
+    - reason: REQUIRED. Single-sentence justification for choosing hybrid_search for this step (no chain-of-thought)."""
     
     # Handle JSON string input from agent
     import json
@@ -233,7 +248,7 @@ async def hybrid_search(query: str, node_label: str = "Answer") -> str:
     print("🔗 Running graph structure search...")
     try:
         # Invoke the structured tool asynchronously to avoid sync invocation errors
-        graph_results = await graph_search.ainvoke({"query": actual_query})
+        graph_results = await graph_search.ainvoke({"query": actual_query, "reason": f"From hybrid_search: structural relationships for '{actual_query}'"})
     except Exception as e:
         graph_results = f"Graph search unavailable: {str(e)[:100]}..."
     
