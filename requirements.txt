@@ -4,6 +4,7 @@ langchain-core
 langchain-community
 langchain-openai
 langchain-neo4j
+langchain-cohere
 openai
 python-dotenv
 requests

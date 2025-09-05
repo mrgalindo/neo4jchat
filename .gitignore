@@ -51,3 +51,4 @@ Icon
 *.bak
 *.tmp
 
+.roo/

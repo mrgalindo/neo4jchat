@@ -21,6 +21,104 @@ INDEX_BY_LABEL = {
     "Talkingpoint": "talkingpoint_embeddings",
 }
 
+# Search configuration with environment defaults
+def get_search_config():
+    """Get search configuration from environment variables with defaults."""
+    try:
+        k = int(os.getenv('SEMANTIC_SEARCH_K', '5'))
+        k = max(1, min(k, 50))  # Clamp between 1 and 50
+        
+        similarity_threshold = float(os.getenv('SEMANTIC_SEARCH_SIMILARITY_THRESHOLD', '0.0'))
+        similarity_threshold = max(0.0, min(similarity_threshold, 1.0))  # Clamp between 0.0 and 1.0
+        
+        reranker_top_k = int(os.getenv('SEMANTIC_SEARCH_RERANKER_TOP_K', '3'))
+        reranker_top_k = max(1, min(reranker_top_k, k))  # Clamp between 1 and k
+        
+        return {
+            'k': k,
+            'similarity_threshold': similarity_threshold,
+            'use_reranker': os.getenv('SEMANTIC_SEARCH_USE_RERANKER', 'false').lower() == 'true',
+            'reranker_type': os.getenv('SEMANTIC_SEARCH_RERANKER_TYPE', 'none'),
+            'reranker_top_k': reranker_top_k
+        }
+    except (ValueError, TypeError) as e:
+        print(f"Warning: Invalid search configuration, using defaults: {e}")
+        return {
+            'k': 5,
+            'similarity_threshold': 0.0,
+            'use_reranker': False,
+            'reranker_type': 'none',
+            'reranker_top_k': 3
+        }
+
+def _apply_reranker(retriever, config):
+    """Apply reranker to retriever based on configuration using native LangChain parameters."""
+    try:
+        reranker_type = config['reranker_type'].lower()
+        reranker_top_k = config['reranker_top_k']
+        similarity_threshold = config['similarity_threshold']
+        
+        if reranker_type == 'cohere':
+            # Try to use Cohere reranker with native parameters
+            try:
+                print(f"[DEBUG] Attempting to import CohereRerank...")
+                from langchain.retrievers import ContextualCompressionRetriever
+                print(f"[DEBUG] ContextualCompressionRetriever imported successfully")
+                from langchain_cohere import CohereRerank
+                print(f"[DEBUG] CohereRerank imported successfully")
+                
+                cohere_api_key = os.getenv('COHERE_API_KEY')
+                if not cohere_api_key:
+                    print("Warning: COHERE_API_KEY not found, skipping reranker")
+                    return retriever
+                
+                # Use CohereRerank with post-rerank similarity filtering
+                cohere_model = os.getenv('COHERE_RERANK_MODEL', 'rerank-english-v3.0')
+                compressor_kwargs = {
+                    'model': cohere_model,
+                    'cohere_api_key': cohere_api_key,
+                    'top_n': reranker_top_k
+                }
+                
+                compressor = CohereRerank(**compressor_kwargs)
+                compression_retriever = ContextualCompressionRetriever(
+                    base_compressor=compressor,
+                    base_retriever=retriever
+                )
+                
+                print(f"[DEBUG] CohereRerank applied successfully (model: {cohere_model}, top_n: {reranker_top_k})")
+                return compression_retriever
+            except ImportError:
+                print("Warning: CohereRerank not available, skipping reranker")
+                return retriever
+                
+        
+        # If reranker type is unknown or 'none', return original retriever
+        return retriever
+        
+    except Exception as e:
+        print(f"Warning: Failed to apply reranker: {str(e)[:100]}...")
+        return retriever
+
+
+def _apply_post_rerank_filtering(documents, similarity_threshold):
+    """Apply similarity threshold filtering to documents after reranking."""
+    if similarity_threshold <= 0.0:
+        return documents
+    
+    filtered_docs = []
+    for doc in documents:
+        # CohereRerank stores relevance score in metadata
+        relevance_score = doc.metadata.get('relevance_score', 1.0)  # Default to 1.0 if no score
+        if relevance_score >= similarity_threshold:
+            filtered_docs.append(doc)
+        else:
+            print(f"[DEBUG] Filtering out document with relevance_score {relevance_score} < {similarity_threshold}")
+    
+    print(f"[DEBUG] Post-rerank filtered {len(documents)} -> {len(filtered_docs)} documents with threshold {similarity_threshold}")
+    return filtered_docs
+
+
 # Global cache for vector indexes and graph connections
 vector_index_cache = {}
 graph_cache = None
@@ -140,35 +238,98 @@ async def semantic_search(query: str, node_label: str = "Answer", reason: str = 
 
 
 async def _semantic_search_impl(query: str, node_label: str) -> str:
-    """Internal implementation for semantic search."""
+    """Internal implementation for semantic search with configurable parameters."""
     if node_label not in SEMANTIC_NODE_TYPES:
         return f"node_label must be one of {SEMANTIC_NODE_TYPES}"
         
+    # Get search configuration from environment
+    config = get_search_config()
+    
     index_name = INDEX_BY_LABEL.get(node_label, "embeddings")
-    print(f"🔍 Searching {node_label} nodes for: '{query}' (index: {index_name})")
+    print(f"🔍 Searching {node_label} nodes for: '{query}' (index: {index_name}, k={config['k']}, threshold={config['similarity_threshold']}, reranker={config['use_reranker']})")
     
     vector_index = get_vector_index(node_label, index_name)
     if not vector_index:
         return f"No vector index available for {node_label}. Expected index: {index_name}."
     
     try:
-        qa_model = os.getenv("QA_LLM_MODEL", os.getenv("CYPHER_LLM_MODEL", "openai/gpt-4"))
-        qa_temp_str = os.getenv("QA_TEMPERATURE") or os.getenv("DEFAULT_TEMPERATURE", "")
-        qa_temp = None
-        if qa_temp_str and qa_temp_str.strip().lower() not in ("none", "null"):
-            try:
-                qa_temp = float(qa_temp_str)
-            except ValueError:
-                qa_temp = None
-        qa_kwargs = {"max_tokens": 4096}
-        if qa_temp is not None:
-            qa_kwargs["temperature"] = qa_temp
-        vector_qa = RetrievalQA.from_chain_type(
-            llm=make_chat_model(qa_model, **qa_kwargs),
-            chain_type="stuff",
-            retriever=vector_index.as_retriever(),
+        # Configure initial retriever to get more documents for reranking
+        initial_k = config['k'] if not config['use_reranker'] else max(config['k'] * 2, config['reranker_top_k'] * 3)
+        search_kwargs = {"k": initial_k}
+        
+        retriever = vector_index.as_retriever(
+            search_type="similarity",
+            search_kwargs=search_kwargs
         )
-        result = await vector_qa.ainvoke({"query": query})
+        
+        # Check if we're using reranker for post-filtering approach
+        use_reranker_with_filtering = config['use_reranker'] and config['reranker_type'] != 'none'
+        
+        if use_reranker_with_filtering:
+            # Apply reranker and handle post-rerank filtering manually
+            retriever = _apply_reranker(retriever, config)
+            
+            # Get documents from reranker, then apply post-filtering
+            docs = retriever.get_relevant_documents(query)
+            
+            # Apply similarity threshold filtering to reranked results
+            if config['similarity_threshold'] > 0:
+                docs = _apply_post_rerank_filtering(docs, config['similarity_threshold'])
+            
+            # Create QA model
+            qa_model = os.getenv("QA_LLM_MODEL", os.getenv("CYPHER_LLM_MODEL", "openai/gpt-4"))
+            qa_temp_str = os.getenv("QA_TEMPERATURE") or os.getenv("DEFAULT_TEMPERATURE", "")
+            qa_temp = None
+            if qa_temp_str and qa_temp_str.strip().lower() not in ("none", "null"):
+                try:
+                    qa_temp = float(qa_temp_str)
+                except ValueError:
+                    qa_temp = None
+            qa_kwargs = {"max_tokens": 4096}
+            if qa_temp is not None:
+                qa_kwargs["temperature"] = qa_temp
+            
+            # Use documents directly with QA chain
+            from langchain.chains.question_answering import load_qa_chain
+            qa_chain = load_qa_chain(
+                llm=make_chat_model(qa_model, **qa_kwargs),
+                chain_type="stuff"
+            )
+            
+            # Run QA on filtered documents
+            result = await qa_chain.ainvoke({
+                "input_documents": docs,
+                "question": query
+            })
+            
+        else:
+            # Original approach for non-reranker cases
+            if config['similarity_threshold'] > 0:
+                # Apply manual similarity filtering if no reranker is used
+                search_kwargs["score_threshold"] = config['similarity_threshold']
+                retriever = vector_index.as_retriever(
+                    search_type="similarity_score_threshold",
+                    search_kwargs=search_kwargs
+                )
+            
+            qa_model = os.getenv("QA_LLM_MODEL", os.getenv("CYPHER_LLM_MODEL", "openai/gpt-4"))
+            qa_temp_str = os.getenv("QA_TEMPERATURE") or os.getenv("DEFAULT_TEMPERATURE", "")
+            qa_temp = None
+            if qa_temp_str and qa_temp_str.strip().lower() not in ("none", "null"):
+                try:
+                    qa_temp = float(qa_temp_str)
+                except ValueError:
+                    qa_temp = None
+            qa_kwargs = {"max_tokens": 4096}
+            if qa_temp is not None:
+                qa_kwargs["temperature"] = qa_temp
+                
+            vector_qa = RetrievalQA.from_chain_type(
+                llm=make_chat_model(qa_model, **qa_kwargs),
+                chain_type="stuff",
+                retriever=retriever,
+            )
+            result = await vector_qa.ainvoke({"query": query})
         return result.get("result", str(result)) if isinstance(result, dict) else str(result)
     except Exception as e:
         return f"Semantic search failed for {node_label}: {str(e)[:100]}..."
