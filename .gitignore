@@ -14,8 +14,6 @@ __pycache__/
 .venv/
 venv/
 .env
-.env.*
-.venv*
 .python-version
 .mypy_cache/
 .pytest_cache/
@@ -52,3 +50,4 @@ Icon
 *.tmp
 
 .roo/
+WARP.md

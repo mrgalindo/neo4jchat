@@ -10,6 +10,7 @@ from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 from typing_extensions import Literal
 from llm_utils import make_chat_model
+from langchain_core.prompts import PromptTemplate
 
 # Valid node types for semantic search
 SEMANTIC_NODE_TYPES = ['Question', 'Answer', 'Talkingpoint']
@@ -125,6 +126,40 @@ graph_cache = None
 _last_graph_chain_error: Optional[str] = None
 
 
+def _read_text_file(path: str) -> Optional[str]:
+    """Read a text file and return its contents, or None on error."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception as e:
+        print(f"Warning: Could not read prompt file '{path}': {str(e)[:120]}...")
+        return None
+
+
+def _get_prompt_from_env(text_env: str, file_env: str) -> Optional[str]:
+    """Return prompt text from an env var or a file env var if present."""
+    text = os.getenv(text_env)
+    if text and text.strip():
+        return text
+    file_path = os.getenv(file_env)
+    if file_path and file_path.strip():
+        return _read_text_file(file_path.strip())
+    return None
+
+
+def _build_prompt_template(text_env: str, file_env: str, input_variables: list[str], label: str) -> Optional[PromptTemplate]:
+    """Build a PromptTemplate from env/file if provided; else None."""
+    prompt_text = _get_prompt_from_env(text_env, file_env)
+    if prompt_text and prompt_text.strip():
+        print(f"[DEBUG] Using custom {label} prompt from {'env' if os.getenv(text_env) else 'file'}")
+        try:
+            return PromptTemplate(input_variables=input_variables, template=prompt_text)
+        except Exception as e:
+            print(f"Warning: Failed to build {label} PromptTemplate: {str(e)[:120]}...")
+            return None
+    return None
+
+
 def get_vector_index(node_label: str, index_name: str) -> Optional[Neo4jVector]:
     """Get existing vector index for Question, Answer, or Talkingpoint nodes."""
     if node_label not in SEMANTIC_NODE_TYPES:
@@ -189,12 +224,32 @@ def get_graph_chain() -> Optional[GraphCypherQAChain]:
         if qa_temp is not None:
             qa_kwargs["temperature"] = qa_temp
 
+        # Build optional custom prompts for GraphCypherQAChain
+        cypher_prompt = _build_prompt_template(
+            text_env="CYPHER_GENERATION_PROMPT",
+            file_env="CYPHER_GENERATION_PROMPT_FILE",
+            input_variables=["schema", "question"],
+            label="cypher generation",
+        )
+        graph_qa_prompt = _build_prompt_template(
+            text_env="GRAPH_QA_PROMPT",
+            file_env="GRAPH_QA_PROMPT_FILE",
+            input_variables=["context", "question"],
+            label="graph QA",
+        )
+        extra_kwargs = {}
+        if cypher_prompt is not None:
+            extra_kwargs["cypher_prompt"] = cypher_prompt
+        if graph_qa_prompt is not None:
+            extra_kwargs["qa_prompt"] = graph_qa_prompt
+
         graph_cache = GraphCypherQAChain.from_llm(
             cypher_llm=make_chat_model(cypher_model, **cypher_kwargs),
             qa_llm=make_chat_model(qa_model, **qa_kwargs),
             graph=graph,
             verbose=True,
-            allow_dangerous_requests=True
+            allow_dangerous_requests=True,
+            **extra_kwargs,
         )
         _last_graph_chain_error = None
         return graph_cache
@@ -219,7 +274,7 @@ async def semantic_search(query: str, node_label: str = "Answer", reason: str = 
     """Content-only semantic retrieval over Answer|Question|Talkingpoint text.
     Use for themes and meaning in the text; not for attribution, counts, or relationship traversal.
     Args:
-    - query: user query text
+    - query: A single, specific question to search for
     - node_label: one of Answer | Question | Talkingpoint
     - reason: REQUIRED. Single-sentence justification for calling semantic_search for this step (no chain-of-thought)."""
     
@@ -265,6 +320,14 @@ async def _semantic_search_impl(query: str, node_label: str) -> str:
         # Check if we're using reranker for post-filtering approach
         use_reranker_with_filtering = config['use_reranker'] and config['reranker_type'] != 'none'
         
+        # Optional custom semantic QA prompt (input variables: context, question)
+        custom_semantic_prompt = _build_prompt_template(
+            text_env="SEMANTIC_QA_PROMPT",
+            file_env="SEMANTIC_QA_PROMPT_FILE",
+            input_variables=["context", "question"],
+            label="semantic QA",
+        )
+        
         if use_reranker_with_filtering:
             # Apply reranker and handle post-rerank filtering manually
             retriever = _apply_reranker(retriever, config)
@@ -291,10 +354,17 @@ async def _semantic_search_impl(query: str, node_label: str) -> str:
             
             # Use documents directly with QA chain
             from langchain.chains.question_answering import load_qa_chain
-            qa_chain = load_qa_chain(
-                llm=make_chat_model(qa_model, **qa_kwargs),
-                chain_type="stuff"
-            )
+            if custom_semantic_prompt is not None:
+                qa_chain = load_qa_chain(
+                    llm=make_chat_model(qa_model, **qa_kwargs),
+                    chain_type="stuff",
+                    prompt=custom_semantic_prompt,
+                )
+            else:
+                qa_chain = load_qa_chain(
+                    llm=make_chat_model(qa_model, **qa_kwargs),
+                    chain_type="stuff",
+                )
             
             # Run QA on filtered documents
             result = await qa_chain.ainvoke({
@@ -324,10 +394,12 @@ async def _semantic_search_impl(query: str, node_label: str) -> str:
             if qa_temp is not None:
                 qa_kwargs["temperature"] = qa_temp
                 
+            chain_type_kwargs = {"prompt": custom_semantic_prompt} if custom_semantic_prompt is not None else {}
             vector_qa = RetrievalQA.from_chain_type(
                 llm=make_chat_model(qa_model, **qa_kwargs),
                 chain_type="stuff",
                 retriever=retriever,
+                chain_type_kwargs=chain_type_kwargs or None,
             )
             result = await vector_qa.ainvoke({"query": query})
         return result.get("result", str(result)) if isinstance(result, dict) else str(result)
@@ -412,7 +484,40 @@ async def hybrid_search(query: str, node_label: str = "Answer", reason: str = ""
         graph_results = await graph_search.ainvoke({"query": actual_query, "reason": f"From hybrid_search: structural relationships for '{actual_query}'"})
     except Exception as e:
         graph_results = f"Graph search unavailable: {str(e)[:100]}..."
+
+    # If a custom hybrid synthesis prompt is provided, use LLM to generate a single consolidated answer
+    hybrid_prompt = _build_prompt_template(
+        text_env="HYBRID_SYNTHESIS_PROMPT",
+        file_env="HYBRID_SYNTHESIS_PROMPT_FILE",
+        input_variables=["content_insights", "structural_relationships", "question"],
+        label="hybrid synthesis",
+    )
+    if hybrid_prompt is not None:
+        print("🧠 Performing hybrid synthesis with custom prompt...")
+        qa_model = os.getenv("QA_LLM_MODEL", os.getenv("CYPHER_LLM_MODEL", "openai/gpt-4"))
+        qa_temp_str = os.getenv("QA_TEMPERATURE") or os.getenv("DEFAULT_TEMPERATURE", "")
+        qa_temp = None
+        if qa_temp_str and qa_temp_str.strip().lower() not in ("none", "null"):
+            try:
+                qa_temp = float(qa_temp_str)
+            except ValueError:
+                qa_temp = None
+        qa_kwargs = {"max_tokens": 4096}
+        if qa_temp is not None:
+            qa_kwargs["temperature"] = qa_temp
+        try:
+            prompt_text = hybrid_prompt.format(
+                content_insights=str(semantic_results),
+                structural_relationships=str(graph_results),
+                question=actual_query,
+            )
+            llm = make_chat_model(qa_model, **qa_kwargs)
+            response = await llm.ainvoke(prompt_text)
+            return getattr(response, "content", str(response))
+        except Exception as e:
+            return f"Hybrid synthesis failed: {str(e)[:200]}"
     
+    # Default behavior: return a combined report
     return f"""Hybrid analysis for: "{actual_query}"
 
 📊 CONTENT INSIGHTS ({actual_node_label} nodes):

@@ -1,0 +1,19 @@
+Task: Produce a single, well-structured answer grounded strictly in the provided evidence from two sources: content insights and structural relationships.
+
+Rules:
+- Use ONLY the information in the sections below. Do not add outside knowledge.
+- Synthesize the content insights with the structural relationships to directly answer the question.
+- Prefer concise, clear prose with specific names and relationships.
+- If evidence is insufficient to answer, state that clearly.
+
+Question:
+{question}
+
+Content insights (semantic retrieval):
+{content_insights}
+
+Structural relationships (graph traversal):
+{structural_relationships}
+
+Final answer:
+

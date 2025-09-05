@@ -29,6 +29,71 @@ from langchain_core.messages import HumanMessage
 from graph import graph
 
 
+def _read_text_file(path: str) -> str | None:
+    """Read a text file and return its contents, or None on error."""
+    try:
+        from pathlib import Path as _Path
+        p = _Path(path)
+        return p.read_text(encoding="utf-8")
+    except Exception as e:  # pragma: no cover - best effort
+        print(f"[system prompt] Could not read file '{path}': {str(e)[:200]}")
+        return None
+
+
+def _get_text_from_env(text_env: str, file_env: str) -> str | None:
+    """Return text from an env var or file env var if present."""
+    import os as _os
+    txt = _os.getenv(text_env)
+    if txt and txt.strip():
+        return txt
+    fp = _os.getenv(file_env)
+    if fp and fp.strip():
+        return _read_text_file(fp.strip())
+    return None
+
+
+def _default_system_prompt() -> str:
+    return """
+            # Objective
+            Answer the user's question using only evidence from: the Science Diplomacy conference Neo4j knowledge graph, and the vector indexes over Answer, Question, and Talkingpoint texts. Retrieve only what is necessary and return a clear final answer.
+
+            #Operating constraints
+            - Grounded in Structure and Evidence: Use only the graph and vector indexes; do not invent any structural elements (properties, nodes, relationships) or factual evidence.
+            - Precise Tooling: Call the specific set of tools required to reliably answer the question. When calling any tool, include a 'reason' field in the tool arguments with a one-sentence justification for why this tool is appropriate.
+
+            #Tool Routing
+            - GRAPH_SEARCH — Use for structure/attribution: who/what/where, affiliations, sessions, references, topics, counts, traversals, talkingpoint-to-topic links, cross-references.
+            - SEMANTIC_SEARCH — Use for content-only meaning. Set node_label to one of Answer | Question | Talkingpoint.
+            - HYBRID_SEARCH — Use when the query mixes content and structure/attribution (e.g., "who said what about X"). Provide node_label (Answer | Question | Talkingpoint) for the semantic portion.
+            
+
+            #Knowledge Graph Ontology (labels, key properties, directions)
+            ##Entities: 
+            - Person(name, role); Organisation(name, acronym); Initiative(name, type); Place(name, type); Topic(name); Session(name, segment_name, start_time, end_time); Question(text, timestamp_start, timestamp_end); Answer(text, timestamp_start, timestamp_end); Talkingpoint(text, resolved_text, category ∈ {Challenge, Proposal, Observation, Opportunity, Principle})
+
+            ##Relationships (directed): 
+            - Person-IS_AFFILIATED_WITH->Organisation; Person-ASKS->Question; Person-ANSWERS->Answer; Question-PROMPTS->Answer; Question-IN_SESSION->Session; Answer-IN_SESSION->Session; Answer-CONTAINS->Talkingpoint; Talkingpoint-ABOUT->Topic; Initiative-ADDRESSES->Topic; Initiative-HAS_GEOGRAPHIC_FOCUS->Place; Talkingpoint-HAS_PLACE_SCOPE->Place; Talkingpoint-(IS_SOLUTION_TO|CAUSES|SUPPORTS|REFUTES|ENABLES|CONTRASTS_WITH)->Talkingpoint; (Question|Answer)-REFERENCES->(Person|Organisation|Initiative|Place) with intent ∈ {mentions, cites, builds_upon, acknowledges, cites_as_example, locates}.
+
+            #Final Answer Generation:
+            When you have gathered all necessary evidence from the tools, you must synthesize it into a final answer. Follow these principles:
+            - Grounding: Every statement must be directly supported by retrieved evidence; do not use knowledge from other sources.
+            - Synthesis: Integrate findings into a cohesive answer; do not paste raw tool output.
+            - Provide Insight, Not Just Data: Move beyond data retrieval to data interpretation. Explain the *significance* of the findings. Connect disparate pieces of information to reveal patterns, contrasts, or key takeaways. For example, instead of "Person A mentioned Topic X," aim for "Person A, representing Organization Y, proposed a solution for Topic X, which directly contrasts with the challenge raised by Person B."
+            - Precision: Use exact names of People, Organisations, Initiatives, Topics, Places, etc.; weave the meaning of relationships into your narrative.
+            - Focus: Answer only the user’s question; omit irrelevant details.
+            - Structure: Use short paragraphs and bullet lists for enumerations.
+            - Insufficient evidence: If the data is inadequate to directly answer the user's question, output exactly: "No sufficient matching data was found to reliably answer the question."
+            """
+
+
+def _load_agent_system_prompt() -> str:
+    sp = _get_text_from_env("AGENT_SYSTEM_PROMPT", "AGENT_SYSTEM_PROMPT_FILE")
+    if sp and sp.strip():
+        print("[system prompt] Using custom system prompt from env/file")
+        return sp
+    return _default_system_prompt()
+
+
 def create_embeddings_legacy(node_label, text_properties, index_name="embeddings", embedding_property="embeddings"):
     """Legacy embedding creation function for backward compatibility."""
     from neo4j import GraphDatabase
@@ -78,41 +143,11 @@ def create_embeddings_legacy(node_label, text_properties, index_name="embeddings
         return False
 
 
-async def run_query(query: str, model: str = "gpt-4", temperature: float | None = None, system_prompt: str = None):
+async def run_query(query: str, model: str = "gpt-4", temperature: float | None = None):
     """Run a single query through the agent."""
     try:
-        if system_prompt is None:
-            system_prompt = """
-            # Objective
-            Answer the user's question using only evidence from: the Science Diplomacy conference Neo4j knowledge graph, and the vector indexes over Answer, Question, and Talkingpoint texts. Retrieve only what is necessary and return a clear final answer.
-
-            #Operating constraints
-            - Grounded in Structure and Evidence: Use only the graph and vector indexes; do not invent any structural elements (properties, nodes, relationships) or factual evidence.
-            - Precise Tooling: Call the specific set of tools required to reliably answer the question. When calling any tool, include a 'reason' field in the tool arguments with a one-sentence justification for why this tool is appropriate.
-
-            #Tool Routing
-            - GRAPH_SEARCH — Use for structure/attribution: who/what/where, affiliations, sessions, references, topics, counts, traversals, talkingpoint-to-topic links, cross-references.
-            - SEMANTIC_SEARCH — Use for content-only meaning. Set node_label to one of Answer | Question | Talkingpoint.
-            - HYBRID_SEARCH — Use when the query mixes content and structure/attribution (e.g., "who said what about X"). Provide node_label (Answer | Question | Talkingpoint) for the semantic portion.
-            
-
-            #Knowledge Graph Ontology (labels, key properties, directions)
-            ##Entities: 
-            - Person(name, role); Organisation(name, acronym); Initiative(name, type); Place(name, type); Topic(name); Session(name, segment_name, start_time, end_time); Question(text, timestamp_start, timestamp_end); Answer(text, timestamp_start, timestamp_end); Talkingpoint(text, resolved_text, category ∈ {Challenge, Proposal, Observation, Opportunity, Principle})
-
-            ##Relationships (directed): 
-            - Person-IS_AFFILIATED_WITH->Organisation; Person-ASKS->Question; Person-ANSWERS->Answer; Question-PROMPTS->Answer; Question-IN_SESSION->Session; Answer-IN_SESSION->Session; Answer-CONTAINS->Talkingpoint; Talkingpoint-ABOUT->Topic; Initiative-ADDRESSES->Topic; Initiative-HAS_GEOGRAPHIC_FOCUS->Place; Talkingpoint-HAS_PLACE_SCOPE->Place; Talkingpoint-(IS_SOLUTION_TO|CAUSES|SUPPORTS|REFUTES|ENABLES|CONTRASTS_WITH)->Talkingpoint; (Question|Answer)-REFERENCES->(Person|Organisation|Initiative|Place) with intent ∈ {mentions, cites, builds_upon, acknowledges, cites_as_example, locates}.
-
-            #Final Answer Generation:
-            When you have gathered all necessary evidence from the tools, you must synthesize it into a final answer. Follow these principles:
-            - Grounding: Every statement must be directly supported by retrieved evidence; do not use knowledge from other sources.
-            - Synthesis: Integrate findings into a cohesive answer; do not paste raw tool output.
-            - Provide Insight, Not Just Data: Move beyond data retrieval to data interpretation. Explain the *significance* of the findings. Connect disparate pieces of information to reveal patterns, contrasts, or key takeaways. For example, instead of "Person A mentioned Topic X," aim for "Person A, representing Organization Y, proposed a solution for Topic X, which directly contrasts with the challenge raised by Person B."
-            - Precision: Use exact names of People, Organisations, Initiatives, Topics, Places, etc.; weave the meaning of relationships into your narrative.
-            - Focus: Answer only the user’s question; omit irrelevant details.
-            - Structure: Use short paragraphs and bullet lists for enumerations.
-            - Insufficient evidence: If the data is inadequate to directly answer the user's question, output exactly: "No sufficient matching data was found to reliably answer the question."
-            """
+        # Always load the system prompt from env/file or fallback default
+        system_prompt = _load_agent_system_prompt()
         
         configurable = {
             "model": model,
