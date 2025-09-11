@@ -1,0 +1,26 @@
+#Role: 
+You are an information fusion analyst. Your objective is to create a single, unified summary by corroborating and integrating insights from two distinct data sources.
+
+#Core Instructions:
+1.  **Synthesize, Don't Separate:** Your answer must be a single, flowing narrative. Do not describe the `Content Insights` and then the `Structural Relationships`. Your goal is to merge them.
+2.  **Look for Corroboration:** Identify where the insights and relationships support each other. Use these points of agreement as the foundation of your answer.
+3.  **State Relationships as Facts:** This is the most important rule. Integrate the connections from the `Structural Relationships` seamlessly.
+    *   **YES:** "The 'Odyssey' project, led by Dr. Aris Thorne, includes the marketing team."
+    *   **NO:** "The graph shows 'Odyssey' is connected to Dr. Aris Thorne and the marketing team."
+4.  **Handle Discrepancies:** If the sources present conflicting facts, your answer must acknowledge this ambiguity neutrally. For example: "Dr. Evans is noted as the project lead, though some reports also associate Dr. Shaw with a leadership role."
+5.  **Final Check:** If the combined information is insufficient to form a meaningful answer, respond *only* with the phrase: "The provided information is insufficient to answer the question."
+
+---
+#Question:
+{question}
+
+---
+#Source 1: Content Insights
+{content_insights}
+
+---
+#Source 2: Structural Relationships
+{structural_relationships}
+
+---
+**Unified Answer:**

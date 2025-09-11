@@ -4,13 +4,14 @@ from typing import Optional
 from langchain_community.vectorstores import Neo4jVector
 from langchain_openai import OpenAIEmbeddings
 from langchain.chains import RetrievalQA
+from langchain.chains.combine_documents.stuff import create_stuff_documents_chain
 from langchain_neo4j import GraphCypherQAChain, Neo4jGraph
 import os
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 from typing_extensions import Literal
 from llm_utils import make_chat_model
-from langchain_core.prompts import PromptTemplate
+from langchain_core.prompts import PromptTemplate, ChatPromptTemplate
 
 # Valid node types for semantic search
 SEMANTIC_NODE_TYPES = ['Question', 'Answer', 'Talkingpoint']
@@ -170,6 +171,9 @@ def get_vector_index(node_label: str, index_name: str) -> Optional[Neo4jVector]:
         return vector_index_cache[cache_key]
         
     try:
+        # Ensure the retriever returns the correct content property for each label.
+        # Talkingpoint should surface `resolved_text` to the LLM, not `text`.
+        text_prop = "resolved_text" if node_label == "Talkingpoint" else "text"
         vector_index = Neo4jVector.from_existing_index(
             OpenAIEmbeddings(),
             url=os.getenv("NEO4J_URI"),
@@ -177,6 +181,7 @@ def get_vector_index(node_label: str, index_name: str) -> Optional[Neo4jVector]:
             password=os.getenv("NEO4J_PASSWORD"),
             database=os.getenv("NEO4J_DATABASE", "neo4j"),
             index_name=index_name,
+            text_node_property=text_prop,
         )
         vector_index_cache[cache_key] = vector_index
         return vector_index
@@ -260,7 +265,7 @@ def get_graph_chain() -> Optional[GraphCypherQAChain]:
 
 
 class SemanticSearchArgs(BaseModel):
-    query: str = Field(..., description="The natural language query to search for.")
+    query: str = Field(..., description="A single, specific query made by the user")
     node_label: Literal["Answer", "Question", "Talkingpoint"] = Field(
         "Answer", description="The node label to search over for semantic meaning."
     )
@@ -274,7 +279,7 @@ async def semantic_search(query: str, node_label: str = "Answer", reason: str = 
     """Content-only semantic retrieval over Answer|Question|Talkingpoint text.
     Use for themes and meaning in the text; not for attribution, counts, or relationship traversal.
     Args:
-    - query: A single, specific question to search for
+    - query: A single, specific query made by the user
     - node_label: one of Answer | Question | Talkingpoint
     - reason: REQUIRED. Single-sentence justification for calling semantic_search for this step (no chain-of-thought)."""
     
@@ -333,7 +338,7 @@ async def _semantic_search_impl(query: str, node_label: str) -> str:
             retriever = _apply_reranker(retriever, config)
             
             # Get documents from reranker, then apply post-filtering
-            docs = retriever.get_relevant_documents(query)
+            docs = retriever.invoke(query)
             
             # Apply similarity threshold filtering to reranked results
             if config['similarity_threshold'] > 0:
@@ -352,23 +357,19 @@ async def _semantic_search_impl(query: str, node_label: str) -> str:
             if qa_temp is not None:
                 qa_kwargs["temperature"] = qa_temp
             
-            # Use documents directly with QA chain
-            from langchain.chains.question_answering import load_qa_chain
+            # Use documents directly with modern stuff chain
             if custom_semantic_prompt is not None:
-                qa_chain = load_qa_chain(
-                    llm=make_chat_model(qa_model, **qa_kwargs),
-                    chain_type="stuff",
-                    prompt=custom_semantic_prompt,
-                )
+                prompt = ChatPromptTemplate.from_template(custom_semantic_prompt.template)
             else:
-                qa_chain = load_qa_chain(
-                    llm=make_chat_model(qa_model, **qa_kwargs),
-                    chain_type="stuff",
+                prompt = ChatPromptTemplate.from_template(
+                    "Use the context to answer.\n\n{context}\n\nQuestion: {question}"
                 )
+            llm = make_chat_model(qa_model, **qa_kwargs)
+            qa_chain = create_stuff_documents_chain(llm, prompt)
             
             # Run QA on filtered documents
             result = await qa_chain.ainvoke({
-                "input_documents": docs,
+                "context": docs,
                 "question": query
             })
             
@@ -408,7 +409,7 @@ async def _semantic_search_impl(query: str, node_label: str) -> str:
 
 
 class GraphSearchArgs(BaseModel):
-    query: str = Field(..., description="The structural/attribution query to answer with Cypher.")
+    query: str = Field(..., description="Natural-language structural question to answer with Cypher.")
     reason: str = Field(..., description="Single-sentence justification for using this tool for this step (no chain-of-thought).")
 
 
@@ -418,7 +419,7 @@ async def graph_search(query: str, reason: str) -> str:
     Use for structural queries like affiliations, sessions, references, topic connections, counts, traversals, and talkingpoint relationships.
     Not for content-only semantics—use semantic_search for meaning.
     Args:
-    - query: natural-language structural question to answer with Cypher
+    - query: Natural-language structural question to answer with Cypher
     - reason: REQUIRED. Single-sentence justification for calling graph_search for this step (no chain-of-thought)."""
     cypher_chain = get_graph_chain()
     if not cypher_chain:
@@ -449,8 +450,8 @@ async def hybrid_search(query: str, node_label: str = "Answer", reason: str = ""
     Provide node_label for the semantic component (Answer | Question | Talkingpoint).
     Use when the query mixes content meaning with attribution/relationships (e.g., 'who said what about X').
     Args:
-    - query: user query text
-    - node_label: semantic target label
+    - query: The query requiring both content and relationship reasoning.
+    - node_label: The node label to use for the semantic component.
     - reason: REQUIRED. Single-sentence justification for choosing hybrid_search for this step (no chain-of-thought)."""
     
     # Handle JSON string input from agent
